@@ -15,12 +15,17 @@
  * - NT-Response uses 21-byte zero-padded NT-Hash split into three 7-byte DES keys.
  */
 #include <Arduino.h>
+#include <SPI.h>
+#include <SdFat.h>  // sdfat by Bill Greiman v2.2.3
+#include <Ethernet.h>
+#include <EthernetUdp.h>
 #include "DES.h"
 #include "MD5.h"
 #include "SHA1.h"
 #include "md4.h"
 #include <string.h>
 #include <stdlib.h>
+#include <limits.h>
 
 DES des;
 MD5 md5;
@@ -108,6 +113,75 @@ const char kMagic1[] = "Magic server to client signing constant";
 const char kMagic2[] = "Pad to make it do more than one iteration";
 }  // namespace
 
+// Runtime settings for the RADIUS listener. Adjust MAC/IP to your LAN before flashing.
+constexpr bool kRunSelfTest = false;  // Set true to run the original hash self-tests at boot.
+
+constexpr uint16_t kRadiusPort = 1812;
+constexpr size_t kMaxRadiusPacket = 512;
+constexpr size_t kMaxUsers = 8;
+constexpr uint32_t kDuplicateWindowMs = 5000;
+
+constexpr uint8_t kEthernetCsPin = 10;  // W5100/W5500 default
+constexpr uint8_t kSdCsPin = 4;         // Arduino Ethernet shield default
+
+constexpr char kUserFileName[] = "user.txt";
+constexpr char kSecretFileName[] = "secret.txt";
+
+byte kMacAddress[] = {0xA0, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE};
+IPAddress kLocalIp(192, 168, 1, 111);
+IPAddress kDnsServer(1, 1, 1, 1);
+IPAddress kGateway(192, 168, 1, 1);
+IPAddress kSubnet(255, 255, 255, 0);
+
+SdFat sd;
+EthernetUDP radiusUdp;
+
+struct UserCredential {
+  char username[64];
+  char password[64];
+};
+
+struct RadiusDuplicate {
+  IPAddress ip;
+  uint8_t identifier;
+  uint8_t authenticator[16];
+  uint32_t lastSeenMs;
+  bool inUse;
+};
+
+struct RadiusRequest {
+  uint8_t buffer[kMaxRadiusPacket];
+  size_t packetLen;
+  uint8_t code;
+  uint8_t identifier;
+  uint16_t length;
+  uint8_t authenticator[16];
+  IPAddress remoteIp;
+  uint16_t remotePort;
+  bool hasMessageAuth;
+  size_t messageAuthOffset;
+  bool hasUsername;
+  char username[64];
+  bool hasMsChapChallenge;
+  uint8_t msChapChallenge[16];
+  bool hasMsChap2Response;
+  uint8_t msChap2Response[50];
+  uint8_t msChapV2Id;
+};
+
+struct MsChapV2Computed {
+  uint8_t challenge[8];
+  uint8_t ntHash[16];
+  uint8_t ntHashHash[16];
+  uint8_t ntResponse[24];
+  uint8_t authResponse[20];
+};
+
+UserCredential gUsers[kMaxUsers];
+size_t gUserCount = 0;
+char gSharedSecret[64] = {0};
+RadiusDuplicate gRecent[4];
+
 void printHex(const uint8_t *data, size_t len) {
   for (size_t i = 0; i < len; ++i) {
     if (data[i] < 0x10) {
@@ -137,6 +211,41 @@ bool equalsHexIgnoreCase(const char *a, const char *b) {
     }
   }
   return *a == '\0' && *b == '\0';
+}
+
+void bytesToHexString(const uint8_t *data, size_t len, char *out) {
+  for (size_t i = 0; i < len; ++i) {
+    sprintf(out + (i * 2), "%02X", data[i]);
+  }
+  out[len * 2] = '\0';
+}
+
+void trimTrailingWhitespace(char *s) {
+  int end = static_cast<int>(strlen(s)) - 1;
+  while (end >= 0 && (s[end] == ' ' || s[end] == '\r' || s[end] == '\n' || s[end] == '\t')) {
+    s[end--] = '\0';
+  }
+}
+
+bool readLine(File &file, char *buffer, size_t maxLen) {
+  size_t pos = 0;
+  while (file.available()) {
+    int c = file.read();
+    if (c < 0) {
+      break;
+    }
+    if (c == '\r') {
+      continue;
+    }
+    if (c == '\n') {
+      break;
+    }
+    if (pos + 1 < maxLen) {
+      buffer[pos++] = static_cast<char>(c);
+    }
+  }
+  buffer[pos] = '\0';
+  return pos > 0;
 }
 
 void ntPasswordHash(const char *password, uint8_t out[16]) {
@@ -238,6 +347,452 @@ size_t appendVendorSpecific(uint8_t *buffer, size_t offset, uint8_t vendorType,
   buffer[offset++] = vendorLen;
   memcpy(buffer + offset, data, len);
   return offset + len;
+}
+
+bool loadSharedSecretFromSd() {
+  File secret = sd.open(kSecretFileName, FILE_READ);
+  if (!secret) {
+    Serial.println("SD: secret.txt not found");
+    return false;
+  }
+
+  char line[sizeof(gSharedSecret)];
+  if (!readLine(secret, line, sizeof(line))) {
+    Serial.println("SD: secret.txt is empty");
+    secret.close();
+    return false;
+  }
+
+  trimTrailingWhitespace(line);
+  strncpy(gSharedSecret, line, sizeof(gSharedSecret) - 1);
+  gSharedSecret[sizeof(gSharedSecret) - 1] = '\0';
+  secret.close();
+  return strlen(gSharedSecret) > 0;
+}
+
+bool loadUsersFromSd() {
+  File users = sd.open(kUserFileName, FILE_READ);
+  if (!users) {
+    Serial.println("SD: user.txt not found");
+    return false;
+  }
+
+  gUserCount = 0;
+  char line[128];
+  while (gUserCount < kMaxUsers && readLine(users, line, sizeof(line))) {
+    trimTrailingWhitespace(line);
+    if (strlen(line) == 0) {
+      continue;
+    }
+    char *sep = strchr(line, ':');
+    if (!sep) {
+      continue;
+    }
+    *sep = '\0';
+    const char *pw = sep + 1;
+
+    strncpy(gUsers[gUserCount].username, line, sizeof(gUsers[gUserCount].username) - 1);
+    gUsers[gUserCount].username[sizeof(gUsers[gUserCount].username) - 1] = '\0';
+    strncpy(gUsers[gUserCount].password, pw, sizeof(gUsers[gUserCount].password) - 1);
+    gUsers[gUserCount].password[sizeof(gUsers[gUserCount].password) - 1] = '\0';
+    ++gUserCount;
+  }
+
+  users.close();
+  return gUserCount > 0;
+}
+
+bool initSdCard() {
+  pinMode(kEthernetCsPin, OUTPUT);
+  digitalWrite(kEthernetCsPin, HIGH);  // keep W5x00 idle while touching SD
+
+  if (!sd.begin(kSdCsPin)) {
+    Serial.println("SD: init failed");
+    return false;
+  }
+
+  const bool secretOk = loadSharedSecretFromSd();
+  const bool usersOk = loadUsersFromSd();
+  if (!secretOk) {
+    Serial.println("SD: failed to load shared secret");
+  }
+  if (!usersOk) {
+    Serial.println("SD: failed to load users");
+  }
+  return secretOk && usersOk;
+}
+
+bool initNetwork() {
+  Ethernet.init(kEthernetCsPin);
+  Ethernet.begin(kMacAddress, kLocalIp, kDnsServer, kGateway, kSubnet);
+
+  delay(5000);  // allow link/DHCP-less init to settle before using IP
+
+  if (Ethernet.localIP() == IPAddress(0, 0, 0, 0)) {
+    Serial.println("Ethernet: init failed (check MAC/IP)");
+    return false;
+  }
+
+  radiusUdp.begin(kRadiusPort);
+  Serial.print("Ethernet: IP ");
+  Serial.println(Ethernet.localIP());
+  return true;
+}
+
+void resetDuplicateTable() {
+  for (size_t i = 0; i < sizeof(gRecent) / sizeof(gRecent[0]); ++i) {
+    gRecent[i].inUse = false;
+  }
+}
+
+bool isDuplicateRequest(const RadiusRequest &req) {
+  const uint32_t now = millis();
+  for (size_t i = 0; i < sizeof(gRecent) / sizeof(gRecent[0]); ++i) {
+    if (!gRecent[i].inUse) {
+      continue;
+    }
+    if (now - gRecent[i].lastSeenMs > kDuplicateWindowMs) {
+      gRecent[i].inUse = false;
+      continue;
+    }
+    if (gRecent[i].identifier == req.identifier &&
+        gRecent[i].ip == req.remoteIp &&
+        memcmp(gRecent[i].authenticator, req.authenticator, sizeof(req.authenticator)) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void rememberRequest(const RadiusRequest &req) {
+  size_t slot = 0;
+  uint32_t oldest = UINT32_MAX;
+  for (size_t i = 0; i < sizeof(gRecent) / sizeof(gRecent[0]); ++i) {
+    if (!gRecent[i].inUse) {
+      slot = i;
+      break;
+    }
+    if (gRecent[i].lastSeenMs < oldest) {
+      oldest = gRecent[i].lastSeenMs;
+      slot = i;
+    }
+  }
+
+  gRecent[slot].inUse = true;
+  gRecent[slot].identifier = req.identifier;
+  gRecent[slot].ip = req.remoteIp;
+  memcpy(gRecent[slot].authenticator, req.authenticator, sizeof(req.authenticator));
+  gRecent[slot].lastSeenMs = millis();
+}
+
+const char *lookupPassword(const char *username) {
+  for (size_t i = 0; i < gUserCount; ++i) {
+    if (strcmp(username, gUsers[i].username) == 0) {
+      return gUsers[i].password;
+    }
+  }
+  return nullptr;
+}
+
+bool parseRadiusRequest(RadiusRequest &req) {
+  if (req.packetLen < 20) {
+    Serial.println("RADIUS: packet too short");
+    return false;
+  }
+
+  req.code = req.buffer[0];
+  req.identifier = req.buffer[1];
+  req.length = static_cast<uint16_t>((req.buffer[2] << 8) | req.buffer[3]);
+  if (req.length != req.packetLen) {
+    Serial.println("RADIUS: length mismatch");
+    return false;
+  }
+
+  memcpy(req.authenticator, req.buffer + 4, 16);
+  req.hasMessageAuth = false;
+  req.hasUsername = false;
+  req.hasMsChapChallenge = false;
+  req.hasMsChap2Response = false;
+  req.msChapV2Id = 0;
+
+  size_t pos = 20;
+  while (pos + 2 <= req.length) {
+    uint8_t type = req.buffer[pos];
+    uint8_t attrLen = req.buffer[pos + 1];
+    if (attrLen < 2 || pos + attrLen > req.length) {
+      Serial.println("RADIUS: bad attribute length");
+      return false;
+    }
+
+    const uint8_t *value = req.buffer + pos + 2;
+    const size_t valueLen = attrLen - 2;
+
+    if (type == kAttrUserName) {
+      const size_t copyLen = min(valueLen, sizeof(req.username) - 1);
+      memcpy(req.username, value, copyLen);
+      req.username[copyLen] = '\0';
+      req.hasUsername = true;
+    } else if (type == kAttrMessageAuthenticator && valueLen == 16) {
+      req.hasMessageAuth = true;
+      req.messageAuthOffset = pos;
+    } else if (type == kAttrVendorSpecific && valueLen >= 6) {
+      const uint32_t vendorId = (static_cast<uint32_t>(value[0]) << 24) |
+                                (static_cast<uint32_t>(value[1]) << 16) |
+                                (static_cast<uint32_t>(value[2]) << 8) |
+                                static_cast<uint32_t>(value[3]);
+      const uint8_t vendorType = value[4];
+      const uint8_t vendorLen = value[5];
+
+      if (vendorId == kVendorIdMicrosoft && vendorLen >= 2 && vendorLen <= valueLen - 4) {
+        const uint8_t *vendorData = value + 6;
+        const size_t vendorDataLen = vendorLen - 2;
+        if (vendorType == kVendorTypeMsChapChallenge && vendorDataLen == 16) {
+          memcpy(req.msChapChallenge, vendorData, 16);
+          req.hasMsChapChallenge = true;
+        } else if (vendorType == kVendorTypeMsChap2Response && vendorDataLen == 50) {
+          memcpy(req.msChap2Response, vendorData, 50);
+          req.msChapV2Id = vendorData[0];
+          req.hasMsChap2Response = true;
+        }
+      }
+    }
+
+    pos += attrLen;
+  }
+
+  return true;
+}
+
+bool verifyMessageAuthenticator(const RadiusRequest &req) {
+  if (!req.hasMessageAuth) {
+    return true;
+  }
+
+  if (strlen(gSharedSecret) == 0) {
+    Serial.println("RADIUS: shared secret missing");
+    return false;
+  }
+
+  uint8_t temp[kMaxRadiusPacket];
+  memcpy(temp, req.buffer, req.length);
+  memset(temp + req.messageAuthOffset + 2, 0x00, 16);
+
+  char *computed = md5.hmac_md5(temp, req.length,
+                                 reinterpret_cast<void *>(gSharedSecret),
+                                 strlen(gSharedSecret));
+  char received[33];
+  bytesToHexString(req.buffer + req.messageAuthOffset + 2, 16, received);
+
+  const bool ok = equalsHexIgnoreCase(computed, received);
+  free(computed);
+  if (!ok) {
+    Serial.println("RADIUS: Message-Authenticator mismatch");
+  }
+  return ok;
+}
+
+bool computeMsChapV2(const RadiusRequest &req, const char *password, MsChapV2Computed &out) {
+  if (!req.hasMsChapChallenge || !req.hasMsChap2Response) {
+    return false;
+  }
+
+  uint8_t peerChallenge[16];
+  memcpy(peerChallenge, req.msChap2Response + 2, 16);
+  memcpy(out.ntResponse, req.msChap2Response + 26, 24);
+
+  challengeHash(peerChallenge, req.msChapChallenge, req.username, out.challenge);
+  ntPasswordHash(password, out.ntHash);
+  challengeResponse(out.ntHash, out.challenge, out.ntResponse);
+
+  if (memcmp(out.ntResponse, req.msChap2Response + 26, 24) != 0) {
+    Serial.println("RADIUS: MS-CHAPv2 response mismatch");
+    return false;
+  }
+
+  ntPasswordHashHash(out.ntHash, out.ntHashHash);
+  authenticatorResponse(out.ntHashHash, out.ntResponse, out.challenge, out.authResponse);
+  return true;
+}
+
+// Placeholders for other auth methods; not yet implemented.
+void handlePapRequest(const RadiusRequest &) {}
+void handleChapRequest(const RadiusRequest &) {}
+void handleEapTlsRequest(const RadiusRequest &) {}
+
+void sendAccessReject(const RadiusRequest &req, bool includeMessageAuth) {
+  uint8_t packet[64];
+  size_t offset = 0;
+  packet[offset++] = 0x03;  // Access-Reject
+  packet[offset++] = req.identifier;
+  packet[offset++] = 0x00;  // Length placeholder
+  packet[offset++] = 0x00;
+  memset(packet + offset, 0x00, 16);  // Response authenticator placeholder
+  offset += 16;
+
+  size_t messageAuthOffset = 0;
+  if (includeMessageAuth) {
+    const uint8_t zeroed[16] = {0};
+    messageAuthOffset = offset;
+    offset = appendAttribute(packet, offset, kAttrMessageAuthenticator,
+                             zeroed, sizeof(zeroed));
+  }
+
+  const uint16_t length = static_cast<uint16_t>(offset);
+  packet[2] = (length >> 8) & 0xFF;
+  packet[3] = length & 0xFF;
+
+  if (includeMessageAuth) {
+    uint8_t hmacInput[kMaxRadiusPacket];
+    memcpy(hmacInput, packet, length);
+    memcpy(hmacInput + 4, req.authenticator, 16);
+    memset(hmacInput + messageAuthOffset + 2, 0x00, 16);
+
+    char *messageAuth = md5.hmac_md5(hmacInput, length,
+                                     reinterpret_cast<void *>(gSharedSecret),
+                                     strlen(gSharedSecret));
+    for (int i = 0; i < 16; ++i) {
+      char byteChars[3] = {messageAuth[i * 2], messageAuth[i * 2 + 1], '\0'};
+      packet[messageAuthOffset + 2 + i] = static_cast<uint8_t>(strtoul(byteChars, nullptr, 16));
+    }
+    free(messageAuth);
+  }
+
+  uint8_t responseAuthenticator[16];
+  MD5_CTX ctx;
+  MD5::MD5Init(&ctx);
+  MD5::MD5Update(&ctx, packet, 4);
+  MD5::MD5Update(&ctx, req.authenticator, 16);
+  MD5::MD5Update(&ctx, packet + 20, length - 20);
+  MD5::MD5Update(&ctx, gSharedSecret, strlen(gSharedSecret));
+  MD5::MD5Final(responseAuthenticator, &ctx);
+  memcpy(packet + 4, responseAuthenticator, sizeof(responseAuthenticator));
+
+  radiusUdp.beginPacket(req.remoteIp, req.remotePort);
+  radiusUdp.write(packet, length);
+  radiusUdp.endPacket();
+}
+
+void sendAccessAccept(const RadiusRequest &req, const MsChapV2Computed &computed) {
+  uint8_t packet[256];
+  size_t offset = 0;
+  packet[offset++] = 0x02;  // Access-Accept
+  packet[offset++] = req.identifier;
+  packet[offset++] = 0x00;  // Length placeholder
+  packet[offset++] = 0x00;
+  memset(packet + offset, 0x00, 16);  // Response authenticator placeholder
+  offset += 16;
+
+  const uint8_t zeroedMessageAuth[16] = {0};
+  const size_t messageAuthOffset = offset;
+  offset = appendAttribute(packet, offset, kAttrMessageAuthenticator,
+                           zeroedMessageAuth, sizeof(zeroedMessageAuth));
+
+  char authResponseHex[41];
+  bytesToHexString(computed.authResponse, sizeof(computed.authResponse), authResponseHex);
+
+  char successMessage[44];
+  snprintf(successMessage, sizeof(successMessage), "S=%s", authResponseHex);
+
+  uint8_t successPayload[48];
+  const size_t successMsgLen = strlen(successMessage);
+  successPayload[0] = req.msChapV2Id;
+  memcpy(successPayload + 1, successMessage, successMsgLen);
+  offset = appendVendorSpecific(packet, offset, kVendorTypeMsChap2Success,
+                                successPayload, successMsgLen + 1);
+
+  const uint16_t length = static_cast<uint16_t>(offset);
+  packet[2] = (length >> 8) & 0xFF;
+  packet[3] = length & 0xFF;
+
+  uint8_t hmacInput[kMaxRadiusPacket];
+  memcpy(hmacInput, packet, length);
+  memcpy(hmacInput + 4, req.authenticator, 16);
+  memset(hmacInput + messageAuthOffset + 2, 0x00, 16);
+
+  char *messageAuth = md5.hmac_md5(hmacInput, length,
+                                   reinterpret_cast<void *>(gSharedSecret),
+                                   strlen(gSharedSecret));
+  for (int i = 0; i < 16; ++i) {
+    char byteChars[3] = {messageAuth[i * 2], messageAuth[i * 2 + 1], '\0'};
+    packet[messageAuthOffset + 2 + i] = static_cast<uint8_t>(strtoul(byteChars, nullptr, 16));
+  }
+  free(messageAuth);
+
+  uint8_t responseAuthenticator[16];
+  MD5_CTX ctx;
+  MD5::MD5Init(&ctx);
+  MD5::MD5Update(&ctx, packet, 4);
+  MD5::MD5Update(&ctx, req.authenticator, 16);
+  MD5::MD5Update(&ctx, packet + 20, length - 20);
+  MD5::MD5Update(&ctx, gSharedSecret, strlen(gSharedSecret));
+  MD5::MD5Final(responseAuthenticator, &ctx);
+  memcpy(packet + 4, responseAuthenticator, sizeof(responseAuthenticator));
+
+  radiusUdp.beginPacket(req.remoteIp, req.remotePort);
+  radiusUdp.write(packet, length);
+  radiusUdp.endPacket();
+}
+
+void handleRadiusPacket() {
+  RadiusRequest req;
+  req.packetLen = radiusUdp.parsePacket();
+  if (req.packetLen <= 0) {
+    return;
+  }
+
+  req.remoteIp = radiusUdp.remoteIP();
+  req.remotePort = radiusUdp.remotePort();
+
+  if (req.packetLen > kMaxRadiusPacket) {
+    Serial.println("RADIUS: packet too large, dropping");
+    uint8_t sink[64];
+    while (radiusUdp.available()) {
+      radiusUdp.read(sink, sizeof(sink));
+    }
+    return;
+  }
+
+  req.packetLen = radiusUdp.read(req.buffer, kMaxRadiusPacket);
+
+  if (!parseRadiusRequest(req)) {
+    return;
+  }
+
+  if (isDuplicateRequest(req)) {
+    Serial.println("RADIUS: duplicate detected, ignoring");
+    return;
+  }
+
+  if (!verifyMessageAuthenticator(req)) {
+    sendAccessReject(req, false);
+    rememberRequest(req);
+    return;
+  }
+
+  if (!req.hasUsername || !req.hasMsChapChallenge || !req.hasMsChap2Response) {
+    Serial.println("RADIUS: missing required MS-CHAPv2 attributes");
+    sendAccessReject(req, req.hasMessageAuth);
+    rememberRequest(req);
+    return;
+  }
+
+  const char *password = lookupPassword(req.username);
+  if (!password) {
+    Serial.println("RADIUS: unknown user");
+    sendAccessReject(req, req.hasMessageAuth);
+    rememberRequest(req);
+    return;
+  }
+
+  MsChapV2Computed computed;
+  if (!computeMsChapV2(req, password, computed)) {
+    sendAccessReject(req, req.hasMessageAuth);
+    rememberRequest(req);
+    return;
+  }
+
+  sendAccessAccept(req, computed);
+  rememberRequest(req);
 }
 
 void testMsChapV2() {
@@ -484,9 +1039,26 @@ void testRadiusAccessAccept() {
 void setup() {
   Serial.begin(9600);
   delay(3000);
-  testMsChapV2();
-  testRadiusAccessRequest();
-  testRadiusAccessAccept();
+
+  resetDuplicateTable();
+
+  if (!initSdCard()) {
+    Serial.println("Setup: SD not ready, authentication will fail");
+  }
+
+  if (!initNetwork()) {
+    Serial.println("Setup: Ethernet init failed");
+  }
+
+  if (kRunSelfTest) {
+    testMsChapV2();
+    testRadiusAccessRequest();
+    testRadiusAccessAccept();
+  }
+
+  Serial.println("Setup: RADIUS listener ready");
 }
 
-void loop() {}
+void loop() {
+  handleRadiusPacket();
+}
