@@ -196,6 +196,24 @@ void printHexLine(const uint8_t *data, size_t len) {
   Serial.println();
 }
 
+// Debug helper: hex dump similar to a short Wireshark view.
+void dumpBuffer(const uint8_t *data, size_t len) {
+  const size_t bytesPerLine = 16;
+  for (size_t i = 0; i < len; i += bytesPerLine) {
+    Serial.print(i, HEX);
+    Serial.print(": ");
+    const size_t lineLen = min(bytesPerLine, len - i);
+    for (size_t j = 0; j < lineLen; ++j) {
+      if (data[i + j] < 0x10) {
+        Serial.print("0");
+      }
+      Serial.print(data[i + j], HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
+  }
+}
+
 bool equalsHexIgnoreCase(const char *a, const char *b) {
   while (*a && *b) {
     char ca = *a++;
@@ -367,6 +385,9 @@ bool loadSharedSecretFromSd() {
   strncpy(gSharedSecret, line, sizeof(gSharedSecret) - 1);
   gSharedSecret[sizeof(gSharedSecret) - 1] = '\0';
   secret.close();
+  Serial.print("SD: loaded shared secret (len=");
+  Serial.print(strlen(gSharedSecret));
+  Serial.println(")");
   return strlen(gSharedSecret) > 0;
 }
 
@@ -399,6 +420,14 @@ bool loadUsersFromSd() {
   }
 
   users.close();
+  Serial.print("SD: loaded users=");
+  Serial.println(gUserCount);
+  for (size_t i = 0; i < gUserCount; ++i) {
+    Serial.print("  user[");
+    Serial.print(i);
+    Serial.print("]: ");
+    Serial.println(gUsers[i].username);
+  }
   return gUserCount > 0;
 }
 
@@ -436,6 +465,12 @@ bool initNetwork() {
   radiusUdp.begin(kRadiusPort);
   Serial.print("Ethernet: IP ");
   Serial.println(Ethernet.localIP());
+  Serial.print("Ethernet: gateway ");
+  Serial.println(kGateway);
+  Serial.print("Ethernet: DNS ");
+  Serial.println(kDnsServer);
+  Serial.print("Ethernet: subnet ");
+  Serial.println(kSubnet);
   return true;
 }
 
@@ -516,6 +551,8 @@ bool parseRadiusRequest(RadiusRequest &req) {
   req.msChapV2Id = 0;
 
   size_t pos = 20;
+  Serial.print("RADIUS: parsing attributes, len=");
+  Serial.println(req.length);
   while (pos + 2 <= req.length) {
     uint8_t type = req.buffer[pos];
     uint8_t attrLen = req.buffer[pos + 1];
@@ -560,6 +597,15 @@ bool parseRadiusRequest(RadiusRequest &req) {
     pos += attrLen;
   }
 
+  Serial.print("RADIUS: hasUser=");
+  Serial.print(req.hasUsername);
+  Serial.print(" hasChal=");
+  Serial.print(req.hasMsChapChallenge);
+  Serial.print(" hasResp=");
+  Serial.print(req.hasMsChap2Response);
+  Serial.print(" hasMsgAuth=");
+  Serial.println(req.hasMessageAuth);
+
   return true;
 }
 
@@ -587,6 +633,8 @@ bool verifyMessageAuthenticator(const RadiusRequest &req) {
   free(computed);
   if (!ok) {
     Serial.println("RADIUS: Message-Authenticator mismatch");
+  } else {
+    Serial.println("RADIUS: Message-Authenticator OK");
   }
   return ok;
 }
@@ -608,6 +656,8 @@ bool computeMsChapV2(const RadiusRequest &req, const char *password, MsChapV2Com
     Serial.println("RADIUS: MS-CHAPv2 response mismatch");
     return false;
   }
+
+  Serial.println("RADIUS: MS-CHAPv2 response OK");
 
   ntPasswordHashHash(out.ntHash, out.ntHashHash);
   authenticatorResponse(out.ntHashHash, out.ntResponse, out.challenge, out.authResponse);
@@ -743,6 +793,13 @@ void handleRadiusPacket() {
   req.remoteIp = radiusUdp.remoteIP();
   req.remotePort = radiusUdp.remotePort();
 
+  Serial.print("RADIUS: pkt from ");
+  Serial.print(req.remoteIp);
+  Serial.print(":");
+  Serial.print(req.remotePort);
+  Serial.print(" len=");
+  Serial.println(req.packetLen);
+
   if (req.packetLen > kMaxRadiusPacket) {
     Serial.println("RADIUS: packet too large, dropping");
     uint8_t sink[64];
@@ -753,6 +810,9 @@ void handleRadiusPacket() {
   }
 
   req.packetLen = radiusUdp.read(req.buffer, kMaxRadiusPacket);
+
+  Serial.println("RADIUS: raw dump");
+  dumpBuffer(req.buffer, req.packetLen);
 
   if (!parseRadiusRequest(req)) {
     return;
@@ -779,6 +839,10 @@ void handleRadiusPacket() {
   const char *password = lookupPassword(req.username);
   if (!password) {
     Serial.println("RADIUS: unknown user");
+    Serial.print("RADIUS: username seen -> ");
+    Serial.println(req.username);
+    Serial.print("RADIUS: loaded users=");
+    Serial.println(gUserCount);
     sendAccessReject(req, req.hasMessageAuth);
     rememberRequest(req);
     return;
